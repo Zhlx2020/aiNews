@@ -60,6 +60,7 @@ C5 = ("https://clients5.google.com/translate_a/t"
 LT = os.environ.get("LT_URL", "https://5001-agq2az3swngxyr5doddjazpmde.instabox.tech/translate")
 MYMEM = "https://api.mymemory.translated.net/get?langpair=en%7Czh-CN&q="
 NTFY = os.environ.get("NTFY_URL", "https://8088-agq2az3swngxyr5doddjazpmde.instabox.tech/airadar")
+NTFY_TOKEN = os.environ.get("NTFY_TOKEN", "")
 BASE = os.environ.get("PANEL_URL", "https://8091-agq2autjlenu2z2aiclsdk4bq4.instabox.tech")
 
 LLM_BASE = os.environ.get("LLM_URL", "https://developer.amd.com.cn/radeon/api/v1/chat/completions")
@@ -830,9 +831,11 @@ def push(items):
     if not top:
         return
     body = "\n".join("\u00b7 " + i["zh_title"][:80] for i in top).encode()
+    headers = {"Title": "AI radar +%d" % len(top), "Click": BASE}
+    if NTFY_TOKEN:
+        headers["Authorization"] = "Bearer " + NTFY_TOKEN
     try:
-        req = urllib.request.Request(NTFY, data=body, method="POST",
-                                     headers={"Title": "AI radar +%d" % len(top), "Click": BASE})
+        req = urllib.request.Request(NTFY, data=body, method="POST", headers=headers)
         urllib.request.urlopen(req, timeout=25).read()
         log("pushed %d" % len(top))
     except Exception as ex:  # noqa: BLE001
