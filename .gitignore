@@ -1,0 +1,6 @@
+archive.jsonl
+seen.json
+*.log
+index.html
+history.html
+ntfy_topic.txt
