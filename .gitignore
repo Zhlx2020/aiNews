@@ -1,3 +1,4 @@
+.env
 archive.jsonl
 seen.json
 *.log

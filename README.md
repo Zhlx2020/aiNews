@@ -24,7 +24,11 @@ python3 -m http.server 8091 --bind 0.0.0.0   # 静态托管
 
 `loop.sh` 每 20 分钟跑一轮。首次运行会自建 `archive.jsonl` / `seen.json`。
 
-## 配置点（airadar.py 顶部）
+## 配置（.env）
+
+复制 .env.example 为 .env 填写，.env 不入库。程序启动时读取，环境变量优先。
+
+## 配置项
 
 | 常量 | 说明 |
 |---|---|

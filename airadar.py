@@ -17,6 +17,22 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 OUT_DIR = "/data/home/airadar"
+
+
+def load_env(path=OUT_DIR + "/.env"):
+    """读 .env（KEY=VALUE），已有环境变量优先。"""
+    try:
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except OSError:
+        pass
+
+
+load_env()
 OUT = OUT_DIR + "/index.html"
 HISTORY = OUT_DIR + "/history.html"
 ARCHIVE = OUT_DIR + "/archive.jsonl"
@@ -27,23 +43,27 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 GOOGLE = ("https://translate.googleapis.com/translate_a/single"
           "?client=dict-chrome-ex&sl=en&tl=zh-CN&dt=t&q=")
-LT = "https://5001-agq2az3swngxyr5doddjazpmde.instabox.tech/translate"
+LT = os.environ.get("LT_URL", "https://5001-agq2az3swngxyr5doddjazpmde.instabox.tech/translate")
 MYMEM = "https://api.mymemory.translated.net/get?langpair=en%7Czh-CN&q="
-NTFY = "https://8088-agq2az3swngxyr5doddjazpmde.instabox.tech/airadar"
-BASE = "https://8091-agq2autjlenu2z2aiclsdk4bq4.instabox.tech"
+NTFY = os.environ.get("NTFY_URL", "https://8088-agq2az3swngxyr5doddjazpmde.instabox.tech/airadar")
+BASE = os.environ.get("PANEL_URL", "https://8091-agq2autjlenu2z2aiclsdk4bq4.instabox.tech")
 
-LLM_CHAIN = [
-    # (base_url, api_key, [models])  —— 依次降级，key 为空表示免鉴权
-    ("https://developer.amd.com.cn/radeon/api/v1/chat/completions",
-     "rc-0e58542132ebf6847a11f58c7bdac1f672a20e63f55fa4db",
-     ["DeepSeek-V4.1-Flash", "GLM-5.3-Flash"]),
-    ("https://text.pollinations.ai/openai", None, ["openai"]),
-    ("https://developer.amd.com.cn/radeon/api/v1/chat/completions",
-     "rc-0e58542132ebf6847a11f58c7bdac1f672a20e63f55fa4db", ["Qwen3.8-Flash-Next"]),
-]
+LLM_BASE = os.environ.get("LLM_URL", "https://developer.amd.com.cn/radeon/api/v1/chat/completions")
+LLM_KEY = os.environ.get("LLM_KEY", "")
+LLM_MODELS = [m for m in os.environ.get("LLM_MODELS", "DeepSeek-V4.1-Flash,GLM-5.3-Flash").split(",") if m]
 
-MF_BASE = "https://8085-agq2az3swngxyr5doddjazpmde.instabox.tech"
-MF_AUTH = base64.b64encode(b"radar:radar-pass-2026").decode()
+LLM_CHAIN = []
+if LLM_KEY:
+    LLM_CHAIN.append((LLM_BASE, LLM_KEY, LLM_MODELS))
+# 免 key 备胎
+LLM_CHAIN.append(("https://text.pollinations.ai/openai", None, ["openai"]))
+if LLM_KEY:
+    LLM_CHAIN.append((LLM_BASE, LLM_KEY, ["Qwen3.8-Flash-Next"]))
+
+MF_BASE = os.environ.get("MF_BASE", "https://8085-agq2az3swngxyr5doddjazpmde.instabox.tech")
+MF_USER = os.environ.get("MF_USER", "radar")
+MF_PASS = os.environ.get("MF_PASS", "")
+MF_AUTH = base64.b64encode(("%s:%s" % (MF_USER, MF_PASS)).encode()).decode()
 
 CATEGORIES = ["AI 资讯", "科技与开源"]
 FRESH_HOURS = 24          # 资讯保鲜时长，超过即入历史
