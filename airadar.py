@@ -5,6 +5,7 @@
 翻译降级链: Google(dict-chrome-ex) -> 自建 LibreTranslate -> MyMemory -> 原文
 """
 import base64
+import hashlib
 import html
 import json
 import os
@@ -38,6 +39,8 @@ HISTORY = OUT_DIR + "/history.html"
 ARCHIVE = OUT_DIR + "/archive.jsonl"
 STATE = OUT_DIR + "/seen.json"
 LOG = OUT_DIR + "/run.log"
+SNAP_DIR = OUT_DIR + "/snap"
+SNAP_KEEP = 1500
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -348,11 +351,126 @@ def section_of(item):
     return FALLBACK_SECTION
 
 
+# ---------- 本地快照 ----------
+def fetch_readme(full_name):
+    """GitHub 仓库 README 正文。"""
+    try:
+        raw = http("https://api.github.com/repos/%s/readme" % full_name,
+                   headers={"Accept": "application/vnd.github.raw"},
+                   timeout=20)
+        return raw
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def extract_article(raw_html):
+    """从 HTML 粗略抽正文：去脚本样式，取最长文本块。"""
+    h = re.sub(r"(?is)<(script|style|nav|header|footer|aside|form)[^>]*>.*?</\1>", " ", raw_html)
+    h = re.sub(r"(?is)<!--.*?-->", " ", h)
+    blocks = re.findall(r"(?is)<(article|main)[^>]*>(.*?)</\1>", h)
+    body = blocks[0][1] if blocks else h
+    paras = re.findall(r"(?is)<p[^>]*>(.*?)</p>", body)
+    if len(" ".join(paras)) < 300:
+        paras = re.findall(r"(?is)<p[^>]*>(.*?)</p>", h)
+    text = "\n\n".join(
+        " ".join(re.sub(r"<[^>]+>", " ", p).split()) for p in paras
+        if len(" ".join(re.sub(r"<[^>]+>", " ", p).split())) > 40)
+    return text[:9000]
+
+
+SNAP_TMPL = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>%(title)s · 快照</title><style>
+*{box-sizing:border-box}
+body{margin:0;background:#fbfaf7;color:#1b1d22;
+ font:17px/1.8 "PingFang SC","Noto Serif SC",Georgia,"Microsoft YaHei",serif}
+.wrap{max-width:760px;margin:0 auto;padding:0 22px 80px}
+.top{position:sticky;top:0;background:#f4f1e9;border-bottom:1px solid #e0d9c9;
+ padding:11px 22px;display:flex;gap:12px;align-items:center;font:13px/1.4 inherit;flex-wrap:wrap}
+.top b{color:#8a4a1f}
+.go{margin-left:auto;background:#1b1d22;color:#fff;text-decoration:none;
+ padding:6px 14px;border-radius:6px;font-size:13px}
+.go:hover{background:#33383f}
+.kicker{font:11px/1 ui-monospace,Menlo,monospace;letter-spacing:1.6px;color:#8a8172;text-transform:uppercase}
+h1{font-size:27px;line-height:1.35;margin:26px 0 6px;letter-spacing:-.3px}
+.meta{font:11.5px/1.6 ui-monospace,Menlo,monospace;color:#9a9282;margin-bottom:18px}
+.sum{background:#fff;border:1px solid #e6e0d4;border-left:3px solid #c0392b;border-radius:0 8px 8px 0;
+ padding:14px 16px;margin:18px 0 24px;font-size:15.5px;color:#33302a}
+.sum b{color:#a5342a}
+.src{border-top:1px dashed #ded7c9;margin-top:26px;padding-top:18px;color:#413c33;font-size:15.5px}
+.src p{margin:0 0 14px}
+pre{white-space:pre-wrap;word-break:break-word;background:#fff;border:1px solid #e6e0d4;
+ border-radius:8px;padding:14px;font:13.5px/1.65 ui-monospace,Menlo,monospace;color:#3a3f46}
+.none{color:#8a8172;font-size:14px}
+a{color:#1b4f8a}
+</style></head><body>
+<div class="top"><span>这是 <b>本地快照</b>，原文在外网</span>
+<a class="go" href="%(url)s" target="_blank" rel="noreferrer">去外网原文 &rarr;</a></div>
+<div class="wrap">
+<span class="kicker">%(kind)s · %(source)s</span>
+<h1>%(title)s</h1>
+<div class="meta">%(host)s · %(time)s</div>
+<div class="sum">%(detail)s</div>
+<div class="src">%(body)s</div>
+</div></body></html>"""
+
+
+def make_snapshot(it):
+    """抓正文落盘成快照页，返回文件名。失败也生成占位页。"""
+    try:
+        os.makedirs(SNAP_DIR, exist_ok=True)
+        key = re.sub(r"[^0-9a-zA-Z]+", "-", it["url"])[-120:]
+        name = (hashlib.sha1(it["url"].encode()).hexdigest()[:16] + "-" + key + ".html")[:150]
+        path = os.path.join(SNAP_DIR, name)
+        if os.path.exists(path):
+            return name
+        body = ""
+        if it["kind"] == "repo":
+            body = fetch_readme(it["title"])
+            inner = '<pre>%s</pre>' % html.escape(body) if body else \
+                '<p class="none">README 抓取失败，请点上方按钮看原文。</p>'
+        else:
+            try:
+                raw = http(it["url"], timeout=18,
+                           headers={"Accept": "text/html,application/xhtml+xml"})
+                txt = extract_article(raw)
+            except Exception:  # noqa: BLE001
+                txt = ""
+            inner = ("".join("<p>%s</p>" % html.escape(p) for p in txt.split("\n\n"))
+                     if txt else '<p class="none">正文抓取失败（可能反爬或需登录），请点上方按钮看原文。</p>')
+        doc = SNAP_TMPL % {
+            "title": html.escape(it.get("zh_title") or it["title"]),
+            "url": html.escape(it["url"]),
+            "source": html.escape(it["source"]),
+            "kind": "\u9879\u76ee" if it["kind"] == "repo" else "\u8d44\u8baf",
+            "host": html.escape(urllib.parse.urlparse(it["url"]).netloc.replace("www.", "")),
+            "time": html.escape(it.get("time", "")[:16].replace("T", " ")),
+            "detail": html.escape(it.get("detail", "")),
+            "body": inner,
+        }
+        open(path, "w", encoding="utf-8").write(doc)
+        return name
+    except Exception as ex:  # noqa: BLE001
+        log("snap: %s" % ex)
+        return ""
+
+
+def prune_snapshots():
+    try:
+        files = sorted((os.path.join(SNAP_DIR, f) for f in os.listdir(SNAP_DIR)),
+                       key=os.path.getmtime, reverse=True)
+        for p in files[SNAP_KEEP:]:
+            os.remove(p)
+    except OSError:
+        pass
+
+
 def prep(it):
     try:
         it["section"] = it.get("section") or section_of(it)
         it["zh_title"] = it["title"] if it["kind"] == "repo" else translate(it["title"])
         it["detail"] = detail(it, use_llm=False)
+        it["snap"] = make_snapshot(it)
     except Exception as ex:  # noqa: BLE001
         log("prep: %s" % ex)
         it.setdefault("zh_title", it["title"])
@@ -427,6 +545,7 @@ p{margin:0 0 8px;color:#413c33;font-size:14.5px}
 .rel{color:#b8b0a0}
 .rel:before{content:"· "}
 .sec{font:11px/1 ui-monospace,Menlo,monospace;color:#b3aa99}
+.org{margin-left:auto;color:#8a4a1f;text-decoration:none;border-bottom:1px solid #e0d0bd}
 .note{margin-top:16px;padding:12px 14px;background:#f4f1e9;border-left:3px solid #d8d1c1;font-size:13px;color:#5d574c}
 footer{border-top:3px double #1b1d22;margin-top:40px;padding:16px 28px;font-size:12px;color:#8a8377}
 .searchbox{padding:9px 12px;border:1px solid #ded7c9;border-radius:6px;font:14px/1.4 inherit;background:#fff;width:min(340px,100%)}
@@ -445,12 +564,18 @@ def card(it, lead=False):
     tag = ('<span class="tag p">项目</span>' if it["kind"] == "repo"
            else '<span class="tag n">资讯</span>')
     host = urllib.parse.urlparse(it["url"]).netloc.replace("www.", "")
-    return ('<article class="%s">%s<h3><a href="%s" target="_blank" rel="noreferrer">%s</a></h3>'
+    snap = it.get("snap")
+    href = ("/snap/" + snap) if snap else it["url"]
+    tgt = "" if snap else ' target="_blank" rel="noreferrer"'
+    origin = ('<a class="org" href="%s" target="_blank" rel="noreferrer">外网原文</a>'
+              % html.escape(it["url"])) if snap else ""
+    return ('<article class="%s">%s<h3><a href="%s"%s>%s</a></h3>'
             '<p>%s</p><div class="meta"><span class="src">%s</span><span>%s</span>'
-            '<span class="sec">%s</span></div></article>'
-            % (kind_cls, tag, html.escape(it["url"]), html.escape(it.get("zh_title") or it["title"]),
+            '<span class="sec">%s</span>%s</div></article>'
+            % (kind_cls, tag, html.escape(href), tgt,
+               html.escape(it.get("zh_title") or it["title"]),
                html.escape(it.get("detail", "")), html.escape(it["source"]),
-               fmt_time(it.get("time", "")), html.escape(host)))
+               fmt_time(it.get("time", "")), html.escape(host), origin))
 
 
 def render(rows):
@@ -506,7 +631,7 @@ def render(rows):
  <a class="hist" href="/history.html">查看历史 &rarr;</a>
 </div></header>
 <main>%s
-<div class="note">红标为资讯（新闻/论文/动态），绿标为项目（新开源仓库，标题保留原名）。都会在 24 小时后归档。</div>
+<div class="note">点标题先看<b>本地快照</b>（页顶有“去外网原文”按钮），外网打不开也能读。红标=资讯，绿标=项目（标题保留原名）。两类都会在 24 小时后归档。</div>
 </main>
 <footer>自动生成 · 每 20 分钟刷新 · 机械翻译存在偏差，以原文为准 · 推送话题 /airadar</footer></body></html>""" % (
         STYLE, len(news), len(repos), now_local.strftime("%m-%d %H:%M"), body)
@@ -524,13 +649,14 @@ def render_history(rows):
             cur = d
             days.append('<div class="day">%s</div>' % d)
         host = urllib.parse.urlparse(r["url"]).netloc.replace("www.", "")
+        href = ("/snap/" + r["snap"]) if r.get("snap") else r["url"]
         days.append('<div class="hrow"><span class="when">%s</span><div>'
-                    '<h4><a href="%s" target="_blank" rel="noreferrer">%s</a></h4>'
-                    '<div class="sub">%s · %s · %s</div></div></div>'
+                    '<h4><a href="%s">%s</a></h4>'
+                    '<div class="sub">%s · %s · %s · <a href="%s" target="_blank" rel="noreferrer">原文</a></div></div></div>'
                     % (parse_t(r.get("time")).astimezone(timezone(timedelta(hours=8))).strftime("%H:%M"),
-                       html.escape(r["url"]), html.escape(r.get("zh_title") or r["title"]),
+                       html.escape(href), html.escape(r.get("zh_title") or r["title"]),
                        html.escape("项目" if r["kind"] == "repo" else "资讯"),
-                       html.escape(r["source"]), html.escape(host)))
+                       html.escape(r["source"]), html.escape(host), html.escape(r["url"])))
     doc = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>历史 · AI 视界</title>
 <style>%s</style></head><body>
@@ -598,6 +724,18 @@ def main():
         save_archive(archive)
         render(archive)
 
+    def snap_pass(it):
+        if not it.get("snap"):
+            it["snap"] = make_snapshot(it)
+        return it
+
+    missing = [r for r in archive if not r.get("snap")][:60]
+    if missing:
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            list(ex.map(snap_pass, missing))
+        save_archive(archive)
+        render(archive)
+
     def llm_pass(it):
         try:
             d = detail(it, use_llm=True)
@@ -617,6 +755,7 @@ def main():
         save_archive(archive)
         render(archive)
     render_history(archive)
+    prune_snapshots()
     if uniq:
         push(uniq)
 
