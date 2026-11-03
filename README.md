@@ -1,3 +1,5 @@
+# aiNews
+
 # AI 视界（ai-radar）
 
 把国外一手 AI 资讯翻成中文并归档的自建信息台。跑在一台一次性 Linux 小机器上，页面是静态 HTML，纯 Python 标准库，无第三方依赖。
