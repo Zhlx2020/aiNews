@@ -46,6 +46,8 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 GOOGLE = ("https://translate.googleapis.com/translate_a/single"
           "?client=dict-chrome-ex&sl=en&tl=zh-CN&dt=t&q=")
+C5 = ("https://clients5.google.com/translate_a/t"
+      "?client=dict-chrome-ex&sl=auto&tl=zh-CN&q=")
 LT = os.environ.get("LT_URL", "https://5001-agq2az3swngxyr5doddjazpmde.instabox.tech/translate")
 MYMEM = "https://api.mymemory.translated.net/get?langpair=en%7Czh-CN&q="
 NTFY = os.environ.get("NTFY_URL", "https://8088-agq2az3swngxyr5doddjazpmde.instabox.tech/airadar")
@@ -74,6 +76,7 @@ REPO_FRESH_HOURS = 72     # 项目从"首次发现"起保留时长
 MAX_ITEMS = 100
 MAX_PER_SECTION = 24
 MAX_LLM = 15
+_title_budget = [10]      # 每轮用 LLM 翻标题的额度
 ARCHIVE_MAX = 4000
 HOURS_BACK = 48
 
@@ -119,6 +122,21 @@ def http(url, payload=None, headers=None, timeout=25):
 
 
 # ---------- 翻译 ----------
+def t_c5(text):
+    """clients5：自动识别语种，单发快，实测最稳。返回结构随参数变化，需归一化。"""
+    d = json.loads(http(C5 + urllib.parse.quote(text[:900]), timeout=12,
+                        headers={"Accept": "application/json"}))
+    head = d[0] if d and isinstance(d[0], list) else d
+    if head and isinstance(head[0], list):
+        parts = [seg[0] or "" for seg in head if isinstance(seg, list)]
+    else:
+        parts = [head[0] if head and isinstance(head[0], str) else ""]
+    out = "".join(parts).strip()
+    if not out:
+        raise RuntimeError("empty c5")
+    return out
+
+
 def t_google(text):
     d = json.loads(http(GOOGLE + urllib.parse.quote(text[:900]), timeout=12,
                         headers={"Accept": "application/json"}))
@@ -138,16 +156,49 @@ def t_mymemory(text):
 def translate(text):
     if not text or not text.strip():
         return ""
-    for fn in (t_google, t_libre, t_mymemory):
-        for _ in range(1):
-            try:
-                out = fn(text)
-                if out and not out.lower().startswith("my memory"):
-                    return out.replace("&#39;", "'").replace("&quot;", '"')
-                break
-            except Exception:  # noqa: BLE001
-                time.sleep(0.7)
+    for fn in (t_c5, t_google, t_libre, t_mymemory):
+        try:
+            out = fn(text)
+            if out and not out.lower().startswith("my memory"):
+                return polish(out)
+        except Exception:  # noqa: BLE001
+            time.sleep(0.7)
     return text
+
+
+POLISH = [
+    ("法学硕士", "大模型"),      # LLM 常被机翻误译
+    ("法学硕士学位", "大模型"),
+    ("大宗语言模型", "大模型"),
+    ("代理工作负载", "智能体任务"),
+    ("人工智能特工", "智能体"),
+    ("特工", "智能体"),
+    ("大型语言模型", "大模型"),
+    ("法学硕士研究", "大模型研究"),
+    ("代理", "智能体"),
+    ("变压器", "Transformer"),
+    ("拥抱脸", "Hugging Face"),
+    ("开源权重的", "开放权重的"),
+    ("推理成本", "推理成本"),
+    ("显卡", "GPU"),
+]
+
+
+def polish(s):
+    for a, b in POLISH:
+        s = s.replace(a, b)
+    s = s.replace("智能体智能", "智能体").replace("智能体化", "智能化")
+    return s.replace("&#39;", "'").replace("&quot;", '"')
+
+
+def t_llm(text):
+    """用 LLM 翻译标题（质量高于机翻）。标题是可选项，快速失败：单次尝试、12 秒超时。"""
+    prompt = ("把下面这条 AI/科技标题翻成简洁的中文，只输出译文，不要解释，"
+              "保留产品名与公司名原文：\n" + text[:300])
+    try:
+        return llm_detail_text(prompt, 90, minlen=1, attempts=1, timeout=12)
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 # ---------- 采集 ----------
@@ -291,20 +342,24 @@ def llm_detail(item):
     prompt = ("用 3-5 句简体中文介绍这条科技资讯：先说它是什么，再说关键细节(数据/方法/产品名)，"
               "最后说影响或看点。不要复述标题，不要客套，像技术媒体编辑。\n标题：%s\n正文：%s"
               % (item["title"], item["summary"][:1200]))
+    return llm_detail_text(prompt, 700, minlen=40)
+
+
+def llm_detail_text(prompt, maxlen=700, minlen=1, attempts=2, timeout=25):
     last = None
     for base, key, models in LLM_CHAIN:
         for model in models:
-            for attempt in range(2):
+            for attempt in range(attempts):
                 try:
                     headers = {"Authorization": "Bearer " + key} if key else {}
                     raw = http(base, {"model": model,
                                       "messages": [{"role": "user", "content": prompt}],
                                       "temperature": 0.3, "max_tokens": 420},
-                               headers=headers, timeout=25)
+                               headers=headers, timeout=timeout)
                     msg_obj = json.loads(raw)["choices"][0].get("message") or {}
                     txt = msg_obj.get("content") or msg_obj.get("reasoning") or ""
-                    txt = re.sub(r"\s+", " ", txt).strip()[:700]
-                    if len(txt) > 40:
+                    txt = re.sub(r"\s+", " ", txt).strip()[:maxlen]
+                    if len(txt) > minlen:
                         return txt
                     last = RuntimeError("empty content")
                     time.sleep(4)
@@ -316,7 +371,7 @@ def llm_detail(item):
                                  or "500" in msg or "503" in msg)
                     if not retryable:
                         break
-                    time.sleep(5 + attempt * 5)
+                    time.sleep(4 + attempt * 4 if attempts > 1 else 0)
         log("llm fallback %s" % last)
     raise RuntimeError("all llm providers failed: %s" % last)
 
@@ -468,7 +523,16 @@ def prune_snapshots():
 def prep(it):
     try:
         it["section"] = it.get("section") or section_of(it)
-        it["zh_title"] = it["title"] if it["kind"] == "repo" else translate(it["title"])
+        if it["kind"] == "repo":
+            it["zh_title"] = it["title"]
+        else:
+            zh = ""
+            if _title_budget[0] > 0:
+                _title_budget[0] -= 1
+                zh = t_llm(it["title"])
+            it["zh_title"] = zh or translate(it["title"])
+            if zh:
+                it["tr_llm"] = True
         it["detail"] = detail(it, use_llm=False)
         it["snap"] = make_snapshot(it)
     except Exception as ex:  # noqa: BLE001
@@ -733,6 +797,28 @@ def main():
     if missing:
         with ThreadPoolExecutor(max_workers=5) as ex:
             list(ex.map(snap_pass, missing))
+        save_archive(archive)
+        render(archive)
+
+    def title_pass(it):
+        try:
+            zh = t_llm(it["title"])
+            if len(zh) > 6:
+                it["zh_title"] = zh
+                it["tr_llm"] = True
+            else:
+                it["tr_try"] = it.get("tr_try", 0) + 1
+        except Exception as ex:  # noqa: BLE001
+            it["tr_try"] = it.get("tr_try", 0) + 1
+            log("title skip: %s" % ex)
+        return it
+
+    pending = [r for r in archive
+               if r["kind"] != "repo" and not r.get("tr_llm")
+               and r.get("tr_try", 0) < 3][:8]
+    if pending:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            list(ex.map(title_pass, pending))
         save_archive(archive)
         render(archive)
 
