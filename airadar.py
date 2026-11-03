@@ -5,11 +5,13 @@
 翻译降级链: Google(dict-chrome-ex) -> 自建 LibreTranslate -> MyMemory -> 原文
 """
 import base64
+import gzip
 import hashlib
 import html
 import json
 import os
 import re
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -41,6 +43,13 @@ STATE = OUT_DIR + "/seen.json"
 LOG = OUT_DIR + "/run.log"
 SNAP_DIR = OUT_DIR + "/snap"
 SNAP_KEEP = 1500
+_chunks_dirty = [False]
+CHUNK_DIR = OUT_DIR + "/chunks"
+CHUNK_BRANCH = os.environ.get("CHUNK_BRANCH", "archive-data")
+CHUNK_URL = os.environ.get("CHUNK_URL", "https://github.com/Zhlx2020/aiNews/tree/archive-data/chunks")
+GIT_URL = os.environ.get("GIT_URL", "")
+GIT_TOKEN = os.environ.get("GIT_TOKEN", "")
+GIT_USER = os.environ.get("GIT_USER", "x-access-token")
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -230,8 +239,84 @@ def load_archive():
     return rows
 
 
+def stamp_of(row):
+    """分卷顺序与月份一律以"发现时间"为准，避免新发现的老仓库被最先挤出去。"""
+    return row.get("first_seen") or row.get("time") or ""
+
+
+def month_of(row):
+    t = stamp_of(row)
+    return (t[:7] or "unknown").replace("/", "-")
+
+
+def spill(rows):
+    """超出上限的旧条目按月压进 chunks/*.jsonl.gz，只留最新 ARCHIVE_MAX 条。"""
+    if len(rows) <= ARCHIVE_MAX:
+        return rows
+    ordered = sorted(rows, key=lambda r: parse_t(stamp_of(r)))
+    cut = len(ordered) - ARCHIVE_MAX
+    overflow, keep = ordered[:cut], ordered[cut:]
+    by_month = {}
+    for r in overflow:
+        by_month.setdefault(month_of(r), []).append(r)
+    os.makedirs(CHUNK_DIR, exist_ok=True)
+    for m, rs in sorted(by_month.items()):
+        path = os.path.join(CHUNK_DIR, m + ".jsonl.gz")
+        with gzip.open(path, "at", encoding="utf-8") as f:
+            for r in rs:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    _chunks_dirty[0] = True
+    log("spill %d -> %d chunk(s)" % (len(overflow), len(by_month)))
+    write_chunk_index()
+    return sorted(keep, key=lambda r: parse_t(r.get("time")), reverse=True)
+
+
+def write_chunk_index():
+    lines = ["# 归档分卷", "",
+             "超过 4000 条的旧条目按月压缩存放，运行中的索引只保留最新 4000 条。", "",
+             "| 月份 | 条目 | 文件 |", "|---|---|---|"]
+    for f in sorted(os.listdir(CHUNK_DIR)):
+        if not f.endswith(".jsonl.gz"):
+            continue
+        p = os.path.join(CHUNK_DIR, f)
+        try:
+            n = sum(1 for _ in gzip.open(p, "rt", encoding="utf-8"))
+        except OSError:
+            n = 0
+        lines.append("| %s | %d | `%s` |" % (f[:7], n, f))
+    lines += ["", "取用：`gunzip -c %s/<月份>.jsonl.gz`，每行一条 JSON。" % "chunks"]
+    open(os.path.join(CHUNK_DIR, "index.md"), "w", encoding="utf-8").write("\n".join(lines) + "\n")
+
+
+def push_chunks():
+    """把 chunks/ 推到 GitHub 的数据分支。失败不影响出报。"""
+    if not (GIT_URL and GIT_TOKEN) or not os.path.isdir(CHUNK_DIR):
+        return
+    try:
+        url = GIT_URL.replace("https://", "https://%s:%s@" % (GIT_USER, GIT_TOKEN), 1)
+        if not os.path.isdir(os.path.join(OUT_DIR, ".git")):
+            subprocess.run(["git", "init", "-q"], cwd=OUT_DIR, check=True)
+        gi = os.path.join(OUT_DIR, ".gitignore")
+        keep = open(gi, encoding="utf-8").read() if os.path.exists(gi) else ""
+        if "!chunks/" not in keep:
+            open(gi, "w", encoding="utf-8").write(keep + "!chunks/\n")
+        subprocess.run(["git", "add", "-f", "chunks"], cwd=OUT_DIR, check=True)
+        staged = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=OUT_DIR)
+        if staged.returncode == 0:
+            return
+        subprocess.run(["git", "-c", "user.email=radar@local", "-c", "user.name=radar",
+                        "commit", "-q", "-m", "archive: chunk %s" % time.strftime("%Y-%m-%d %H:%M")],
+                       cwd=OUT_DIR, check=True)
+        subprocess.run(["git", "push", "-q", "--force", url,
+                        "HEAD:refs/heads/" + CHUNK_BRANCH], cwd=OUT_DIR,
+                       check=True, timeout=180)
+        log("chunks pushed -> %s" % CHUNK_BRANCH)
+    except Exception as ex:  # noqa: BLE001
+        log("chunk push fail: %s" % ex)
+
+
 def save_archive(rows):
-    rows = rows[-ARCHIVE_MAX:]
+    rows = spill(rows)
     tmp = ARCHIVE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         for r in rows:
@@ -725,16 +810,16 @@ def render_history(rows):
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>历史 · AI 视界</title>
 <style>%s</style></head><body>
 <header><div class="brand"><h1>历史</h1><span class="kicker">archive</span></div>
-<p class="desc">全部已归档条目，按时间倒序，最多保留 4000 条。</p>
+<p class="desc">全部已归档条目，按时间倒序。这里保留最新 4000 条，更早的按月压缩上传到归档仓库。</p>
 <div class="bar"><input class="searchbox" id="q" placeholder="搜标题 / 来源…">
 <a class="hist" href="/">返回首页 &rarr;</a></div></header>
 <main id="list">%s</main>
-<footer>共 %d 条</footer>
+<footer>共 %d 条 · <a href="%s">更早的分卷归档</a></footer>
 <script>
 const q=document.getElementById('q'),list=document.getElementById('list');
 q.addEventListener('input',()=>{const v=q.value.trim().toLowerCase();
  for(const el of list.querySelectorAll('.hrow')){el.style.display=!v||el.textContent.toLowerCase().includes(v)?'':'none';}});
-</script></body></html>""" % (STYLE, "".join(days) or "<p>空</p>", len(rows))
+</script></body></html>""" % (STYLE, "".join(days) or "<p>空</p>", len(rows), CHUNK_URL)
     tmp = HISTORY + ".tmp"
     open(tmp, "w", encoding="utf-8").write(doc)
     os.replace(tmp, HISTORY)
@@ -842,6 +927,8 @@ def main():
         render(archive)
     render_history(archive)
     prune_snapshots()
+    if _chunks_dirty[0]:
+        push_chunks()
     if uniq:
         push(uniq)
 
